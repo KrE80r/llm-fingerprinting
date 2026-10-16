@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite it as below."
+title: "Which Model Is Behind This API? Integrating and Evaluating Black-Box LLM Fingerprints"
+authors:
+  - alias: KrE80r
+    website: "https://kre80r.com"
+date-released: 2026-10-15
+url: "https://kre80r.com/is-it-really-opus/"
+license: [CC-BY-4.0, MIT]
+type: software
+preferred-citation:
+  type: report
+  title: "Which Model Is Behind This API? Integrating and Evaluating Black-Box LLM Fingerprints"
+  authors:
+    - alias: KrE80r
+      website: "https://kre80r.com"
+  year: 2026
+  url: "https://kre80r.com/is-it-really-opus/"
