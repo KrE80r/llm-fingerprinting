@@ -60,6 +60,21 @@ class OpenSetClassificationTest(unittest.TestCase):
         self.assertEqual(result["model"], "unknown")
         self.assertIn(result["candidate_model"], refs)
 
+    def test_known_gpt_twins_cannot_be_named_by_an_apparent_structural_lead(self):
+        twins = ("openai/gpt-6-astra", "openai/gpt-6.1-sol")
+        for winner, other in (twins, twins[::-1]):
+            with self.subTest(winner=winner):
+                refs = {winner: ref("openai", "gpt"), other: ref("openai", "gpt", {k: 10 for k in fpx.PROBES})}
+                same = {"sys": 0, "tool_id": "call_same", "err": "same"}
+                refs[winner]["probes"][0]["stack"] = same
+                refs[other]["probes"][0]["stack"] = {"sys": 1, "tool_id": "call_other", "err": "other"}
+                observation = {**features(), "stack": same}
+                for candidates in (refs, {winner: refs[winner]}):
+                    result = fpx.classify(observation, candidates)
+                    self.assertEqual(result["lab"], "openai")
+                    self.assertEqual(result["candidate_model"], winner)
+                    self.assertEqual(result["model"], "unknown")
+
 
 class LeaveOneLabOutTest(unittest.TestCase):
     def test_counts_correct_unknown_and_wrong_family_names(self):

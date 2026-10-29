@@ -503,6 +503,7 @@ MIN_FAMILY_GAP = 1.0        # A001: nearest other family must be this much furth
 STRONG_CAPABILITY = 4        # G12: capability evidence this strong counts as two blocks
 BEHAV_MIN_ITEMS = 1          # G18: one disjoint item per block (items need MIN_ITEM_OBS sessions); was 2 until G16
 STACK_FIELDS = {"sys", "asst", "tool_id", "err", "finish", "sysfp", "reasoning_channel"}   # a reference needs all of them
+GPT_TWIN_MODELS = tuple(f"openai/{model}" for model in fp2.GPT_TWIN.split("|"))
 
 
 def lab_of(model_id): return model_id.split("/")[0]
@@ -856,7 +857,8 @@ def classify(f, refs, exclude=None, certify=True):
         best = max(ties, key=lead_of); dt1 = model_score(f, cand[best])[1]
     block_lead = lead_of(best)
     # R4 (G8): the lead is counted in independent blocks only (block lead >= 2 implies >= 2 differing fields).
-    model_ok = dt1 <= MAX_MODEL_DISTANCE and block_lead >= MIN_STRUCTURAL_LEAD
+    known_twin = best in GPT_TWIN_MODELS
+    model_ok = not known_twin and dt1 <= MAX_MODEL_DISTANCE and block_lead >= MIN_STRUCTURAL_LEAD
     # G10/G19 certification is a redundant safety check against a single changed evidence item.
     if model_ok and certify:
         model_ok = certify_name(f, cand, best)
@@ -868,6 +870,7 @@ def classify(f, refs, exclude=None, certify=True):
             "score": round(s1, 2), "structural_distance": round(dt1, 2), "margin": round(margin, 2),
             "runner_up": runner[2], "unknown_model": not model_ok,
             "why_model_unknown": None if model_ok else
+                f"known indistinguishable group: {fp2.GPT_TWIN}" if known_twin else
                 f"requires structural_distance<={MAX_MODEL_DISTANCE} "
                 f"and a structural lead >={MIN_STRUCTURAL_LEAD} over the runner-up"}
 

@@ -251,11 +251,12 @@ def seller_identity(rows, ref_id, vecs):
         if t["state"] == "legacy_unattributed": legacy += 1
         if t["state"] in BLOCKERS: blockers.add(t["state"])
         else: outcomes.append((row["_idx"], t["outcome"])); raws_all.append(t["raws"])
-    for k in PROBES:  # same pinned prompt served with different raw counts: template overhead varies
+    for k in PROBES:
         vals = {r[k] for r in raws_all}
         if len(raws_all) > 1 and len(vals) > 1:
-            blockers.add("comparison_unreliable")
             acct.append({"kind": "variable_overhead", "cell": k, "values": sorted(vals)})
+        if len({r[k] - r["ok"] for r in raws_all}) > 1:
+            blockers.add("comparison_unreliable")
     if legacy and outcomes: ident.append({"kind": "mixed_eras", "legacy_rows": legacy})
     if len({o for _, o in outcomes}) > 1:
         result = "unknown"

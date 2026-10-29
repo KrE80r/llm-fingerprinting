@@ -174,15 +174,14 @@ class Accounting(unittest.TestCase):
         self.assertIn("negative_delta", s["identity"]["accounting"]["categories"])
         self.assertNotIn("comparison_unreliable", s["identity"]["reasons"] or [])
 
-    def test_variable_overhead_blocks_comparison(self):
-        """Two attributed repeats of the same pinned probes disagree on raw counts: unreliable."""
+    def test_constant_session_offsets_preserve_tokenizer_compatibility(self):
         a = ev_row(); b = ev_row()
         for k in b["tok"]: b["tok"][k] += 37
         code, _, rep = run([a, b], CATALOG, refs_db())
         s = seller0(rep)
-        self.assertEqual(s["identity"]["result"], "unknown")
-        self.assertIn("comparison_unreliable", s["identity"]["reasons"])
-        self.assertIn("comparison_unreliable", s["identity"]["evidence_state"])
+        self.assertEqual(s["identity"]["result"], "compatible_tokenizer")
+        self.assertNotIn("comparison_unreliable", s["identity"]["reasons"])
+        self.assertIn("variable_overhead", s["identity"]["accounting"]["categories"])
 
     def test_fixed_low_counts_not_fraud(self):
         """Fixed identical tiny counts are metering observations, not fraud."""

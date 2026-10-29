@@ -42,6 +42,8 @@ Do not flatten per-model observations into a blanket judgment about a seller. Ke
 
 Tokenizer deltas are differences, not raw counts: a synthetic example is 20 raw tokens minus a 30-token baseline, yielding -10. Neither raw count is negative. Variable hidden prompts, adapters or metering conventions can invalidate a constant-offset comparison. Usage fields alone do not establish fraud or billed amounts. Missing reasoning can reflect settings, filtering or reporting rather than model substitution.
 
+Across repeat sessions, a uniform offset applied to both the baseline and every probe cancels in the deltas. Record changed raw overhead as a metering observation; only changing baseline-subtracted probe deltas makes this repeat comparison unreliable.
+
 ## Exact-model reference requirements
 
 Use fresh generation access to the exact advertised model through an independently trusted route, record provider/settings, and evaluate held-out repeats against plausible alternatives. A first-party API is preferred; a trusted broker route must pin the intended provider and disable fallback. A successful `/models` listing does not establish generation access. Never enroll the seller under assessment as its own reference.
@@ -49,6 +51,8 @@ Use fresh generation access to the exact advertised model through an independent
 The included database does not contain exact references for every default target, and documents unresolved sibling collisions. Sibling references must not substitute for missing exact references. The offline seller report currently has no independently calibrated positive-trust mode: tokenizer compatibility stays compatibility, and exact-model confidence stays unknown. Existing `identify` and `verify-ref` outputs are classifier results, not authenticated seller verdicts; their calibration does not automatically transfer between gateways.
 
 `verify-ref` returns `INDETERMINATE` when the claimed reference remains compatible but the classifier cannot name an exact model; abstention is not a mismatch. An absent claimed reference returns `insufficient_reference`. `MISMATCH` describes disagreement with the enrolled reference, not proof of substitution. The family verifier reports indistinguishable GPT Astra/Sol twins as `CONSISTENT_WITH_GROUP`, never exact-model confirmation.
+
+`identify` also refuses an exact name for the verifier's known Astra/Sol group, even if noisy stack or behaviour features appear to favour one member, or only one member is enrolled. `candidate_model` remains a nearest candidate, not an identity verdict. Benchmark figures in the report describe their evaluated source snapshot; later abstention guards can reduce naming coverage.
 
 Even well-calibrated black-box agreement is conditional evidence, not cryptographic attestation of weights. A binary honesty list is unjustified when competing models remain indistinguishable.
 
