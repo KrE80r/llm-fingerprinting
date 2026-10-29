@@ -14,14 +14,21 @@ Endpoint styles:
   OpenAI chat-completions  identify / verify-ref / probe   (OpenRouter by default, or --base URL --key-env VAR)
   Anthropic messages, OpenAI responses  verify / cache-oracle
       path: or | resr | as:<peerId> | px:<port> | url:<base-url>  (url: uses $FPX_KEY and native model ids)
+Seller pinning (chat-completions commands): --pin PEER sends x-antseed-pin-peer on EVERY request and
+verifies each response echoes the same peer id in x-antseed-peer-id. A pinned request whose response
+lacks the header or names another peer keeps its raw observation but is not usable as model evidence:
+tokenizer cells become None (raw counts stay in request_evidence.tok.<key>.raw_prompt_tokens), the
+serving-stack/behaviour signatures skip the session, token-id runs abstain with reason pin_unverified,
+and one-word samples carry attribution_error so the distribution layer ignores them. Unpinned runs
+behave exactly as before. pin_peer is provenance (who was pinned), provider_pin the provider option.
 usage:
-  python3 fpx.py identify     <refs.json> <model-id> [--base URL] [--key-env VAR] [--provider NAME]   # unknown/stealth
-  python3 fpx.py token-id     <token-id-refs.json> <model-id> [--base URL] [--key-env VAR] [--provider NAME]
-  python3 fpx.py verify-ref   <refs.json> <model-id> <claimed-ref> [--base URL] [--key-env VAR]
+  python3 fpx.py identify     <refs.json> <model-id> [--base URL] [--key-env VAR] [--provider NAME] [--pin PEER]   # unknown/stealth
+  python3 fpx.py token-id     <token-id-refs.json> <model-id> [--base URL] [--key-env VAR] [--provider NAME] [--pin PEER]
+  python3 fpx.py verify-ref   <refs.json> <model-id> <claimed-ref> [--base URL] [--key-env VAR] [--pin PEER]
   python3 fpx.py verify       <path> <claimed>       # Claude/GPT exact model via gates + reasoning habit (7 req)
   python3 fpx.py cache-oracle <path> <claimed> <alt> # substitution check: does label <alt> share <claimed>'s cache?
   python3 fpx.py audit        <path> <claimed> <alt>... [--out f.jsonl]  # STACKED verdict: gates+habit+replay+cache
-  python3 fpx.py probe        <out.jsonl> <tag> <model-id> [...]   # collect reference/held-out probes
+  python3 fpx.py probe        <out.jsonl> <tag> <model-id> [...] [--pin PEER]   # collect reference/held-out probes
   python3 fpx.py build        <refs.json> <probe.jsonl>...         # freeze reference DB
   python3 fpx.py evaluate     <refs.json> <probe.jsonl>... [--layers tok,stack,art]
 """
@@ -59,13 +66,14 @@ def chat(*a, **kw):
         time.sleep(wait)
 
 
-def _chat(url, key, model, messages, stream=False, max_tokens=16, reasoning=None, provider=None, timeout=180, extra=None):
+def _chat(url, key, model, messages, stream=False, max_tokens=16, reasoning=None, provider=None, timeout=180, extra=None, pin=None):
     body = {"model": model, "messages": messages, "max_tokens": max_tokens, "stream": stream, **(extra or {})}
     if reasoning: body["reasoning"] = reasoning
     if provider: body["provider"] = {"order": [provider], "allow_fallbacks": False}
     if stream: body["stream_options"] = {"include_usage": True}
     h = {"content-type": "application/json"}
     if key: h["authorization"] = "Bearer " + key
+    if pin: h["x-antseed-pin-peer"] = pin   # seller audit: bind THIS request to one seller
     import urllib.request, urllib.error
     rec, chunks, t0 = {"model": model}, [], time.perf_counter_ns()
     try:
@@ -73,16 +81,30 @@ def _chat(url, key, model, messages, stream=False, max_tokens=16, reasoning=None
         rec["status"], rec["headers"] = r.status, dict(r.headers)
         while (c := r.read1(65536)): chunks.append((time.perf_counter_ns() - t0, c))
     except urllib.error.HTTPError as e:
-        rec["status"], rec["error"] = e.code, e.read().decode("utf-8", "replace")[:8000]
+        rec["status"], rec["headers"] = e.code, dict(e.headers)   # error responses keep their headers: attribution lives there
+        error_body = e.read()
+        chunks.append((time.perf_counter_ns() - t0, error_body))
+        rec["error"] = error_body.decode("utf-8", "replace")[:8000]
     except Exception as e:
         rec["status"], rec["error"] = -1, repr(e)[:300]
     raw = b"".join(c for _, c in chunks)
     if not stream:
         try: rec["json"] = json.loads(raw)
-        except Exception: rec.setdefault("error", raw.decode("utf-8", "replace")[:8000])
+        except Exception:
+            rec.setdefault("error", raw.decode("utf-8", "replace")[:8000])
+            rec["invalid_response"] = True
+        if "json" in rec and not isinstance(rec["json"], dict):
+            rec["raw_json"] = rec.pop("json")
+            rec["error"], rec["invalid_response"] = "response JSON must be an object", True
         if "json" in rec and "error" in rec["json"]: rec["error"] = json.dumps(rec["json"]["error"])[:8000]
     else:
         rec["events"] = [(t, e, d) for t, e, d in fp2.parse_sse(chunks)]
+    served = next((v for k, v in (rec.get("headers") or {}).items() if k.lower() == "x-antseed-peer-id"), None)
+    if pin:   # per-request: x-served-by is a display name, never identity; no echo means unverifiable
+        rec["attribution"] = {"requested_peer": pin, "served_peer": served, "verified": served == pin}
+        if served != pin:
+            rec["attribution_error"] = "no x-antseed-peer-id header on response" if served is None \
+                else f"response served by peer {served}, not {pin}"
     return rec
 
 
@@ -132,13 +154,27 @@ BEHAV = {
 }
 
 
-def probe(model, base=None, key_env=None, provider=None):
+def _verified(r):
+    """Whether request attribution permits evidence; unpinned callers keep the existing behaviour.
+    HTTP status and response validity are checked separately by each evidence layer."""
+    return not (r.get("attribution") and not r["attribution"]["verified"])
+
+
+def gate(r):
+    """Keep malformed or pinned-unverified observations out of every evidence layer,
+    including error/capability fingerprints from non-200 responses."""
+    r["quarantined"] = bool(r.get("invalid_response")) or not _verified(r)
+    return r
+
+
+def probe(model, base=None, key_env=None, provider=None, pin=None):
     url, key = endpoint(base, key_env)
-    one = lambda text: chat(url, key, model, [{"role": "user", "content": text}], max_tokens=16, provider=provider)
-    msg = lambda ms, **kw: chat(url, key, model, ms, provider=provider, **kw)
+    one = lambda text: chat(url, key, model, [{"role": "user", "content": text}], max_tokens=16, provider=provider, pin=pin)
+    msg = lambda ms, **kw: chat(url, key, model, ms, provider=provider, pin=pin, **kw)
     with cf.ThreadPoolExecutor(6) as ex:
-        tok = dict(zip(["ok", *PROBES], ex.map(one, ["ok", *PROBES.values()])))
-        reason = ex.submit(chat, url, key, model, [{"role": "user", "content": REASON_Q}], False, 1500, {"effort": "low"}, provider)
+        tok = {k: gate(v) for k, v in zip(["ok", *PROBES], ex.map(one, ["ok", *PROBES.values()]))}
+        reason = ex.submit(chat, url, key, model, [{"role": "user", "content": REASON_Q}], False, 1500,
+                           {"effort": "low"}, provider, pin=pin)
         # A003: no streams. Decode speed tracked host, load and time, not the model, and never changed a decision.
         stack = {  # serving-stack probes (round M2): template Jacobian, tool-call serializer, raw upstream error
             "sys": ex.submit(msg, [{"role": "system", "content": "x"}, {"role": "user", "content": "ok"}]),
@@ -149,10 +185,23 @@ def probe(model, base=None, key_env=None, provider=None):
             "effort_none": ex.submit(msg, [{"role": "user", "content": "Reply with: ok"}], reasoning={"effort": "none"}),
         }
         behav = behav_battery(ex, msg)
-        reason = reason.result()
-        stack = {k: v.result() for k, v in stack.items()}
-        behav = {k: v.result() for k, v in behav.items()}
-    return {"model": model, "tok": {k: ((v.get("json") or {}).get("usage") or {}).get("prompt_tokens") for k, v in tok.items()},
+        reason, stack, behav = gate(reason.result()), {k: gate(v.result()) for k, v in stack.items()}, \
+            {k: gate(v.result()) for k, v in behav.items()}
+    # tok cells keep raw prompt_tokens (accounting) only for usable requests; a quarantined token probe is
+    # None in tok while its raw count stays in request_evidence. Full _chat records stay in ok_raw/tok_raw.
+    count = lambda v: ((v.get("json") or {}).get("usage") or {}).get("prompt_tokens") \
+        if v.get("status") == 200 and _verified(v) else None
+    def ev(v):
+        raw = ((v.get("json") or {}).get("usage") or {}).get("prompt_tokens")
+        return {"status": v.get("status"), "attribution": v.get("attribution"),
+                **({"error": v["attribution_error"]} if v.get("attribution_error") else {}),
+                **({"raw_prompt_tokens": raw} if raw is not None else {})}
+    req_ev = {k: ev(v) for k, v in tok.items()}
+    ev_pin = {"pin_peer": pin, "pin_ok": all(_verified(v) for v in
+              [*tok.values(), reason, *stack.values(), *behav.values()]) if pin else None}
+    return {"model": model, "pin_peer": pin, "pin_ok": ev_pin["pin_ok"],
+            "request_evidence": {**ev_pin, "tok": req_ev}, "ok_raw": tok["ok"], "tok_raw": tok,
+            "tok": {k: count(v) for k, v in tok.items()},
             "tok_err": {k: v.get("error") for k, v in tok.items() if v.get("status") != 200},
             "ok_json": tok["ok"].get("json"), "stack": stack, "reason": reason, "behav": behav, "wall": time.time()}
 
@@ -164,6 +213,12 @@ def behav_battery(ex, msg):
 def behav_sig(p):
     """G8: coarse categories of the temperature-0 battery. Missing (None) when the reply is transient or empty."""
     import unicodedata
+    # Quarantined (pinned, wrong/absent peer) records are not this model's answers; behav_sig reads
+    # behav items, the reason request, and the sys/asst/tool stack records (think shapes).
+    st_ = p.get("stack") or {}
+    if any((r or {}).get("quarantined") for r in [*iter((p.get("behav") or {}).values()), p.get("reason"),
+                                                  *(st_.get(k) for k in ("ok", "sys", "asst", "tool"))]) \
+            or (p.get("ok_raw") or {}).get("quarantined"): return {}
     out = {}
     for k, r in (p.get("behav") or {}).items():
         st = r.get("status") or 0
@@ -278,6 +333,10 @@ def stack_sig(p):
     """Serving-stack signature (round M2): categorical, timing-free."""
     st_ = p.get("stack")
     if not st_: return {}
+    # A pinned-but-unverified request is not model evidence: skip the whole signature rather than
+    # mixing another peer's answers into this one.
+    if (p.get("ok_raw") or {}).get("quarantined") or (p.get("reason") or {}).get("quarantined") \
+            or any(r.get("quarantined") for r in st_.values()): return {}
     pt = lambda r: (((r.get("json") or {}).get("usage") or {}).get("prompt_tokens"))
     base = p["tok"].get("ok")
     sig = {}
@@ -331,9 +390,9 @@ def stack_sig(p):
 def features(p):
     base = p["tok"].get("ok")
     tokv = {k: (p["tok"][k] - base) if (p["tok"].get(k) is not None and base is not None) else None for k in PROBES}
-    a = artifact(p["reason"])
+    a = artifact({}) if (p.get("reason") or {}).get("quarantined") else artifact(p["reason"])
     return {"tok": tokv, "art": a, "art_lab": lab_from_artifact(a), "stack": stack_sig(p),
-            "reason_tok": a["reasoning_tokens"], "behav": behav_sig(p)}
+            "reason_tok": a.get("reasoning_tokens"), "behav": behav_sig(p)}
 
 
 
@@ -402,25 +461,31 @@ def classify_token_id_rows(rows, db):
 
 
 def load_token_id_db(path):
-    db = json.load(open(path))
+    with open(path) as f: db = json.load(f)
     if db.get("schema") != "fpx.token-id-reference/v1" or not isinstance(db.get("namespaces"), dict):
         raise ValueError(f"{path}: expected fpx.token-id-reference/v1")
     return db
 
 
-def identify_token_id_namespace(refs_path, model, base=None, key_env=None, provider=None):
-    """Run the N001 two-repeat target-only probe; references stay on disk."""
+def identify_token_id_namespace(refs_path, model, base=None, key_env=None, provider=None, pin=None):
+    """Run the N001 two-repeat target-only probe; references stay on disk.
+    Pinned but unverified rows keep their raw observation yet cannot support a namespace verdict."""
     db = load_token_id_db(refs_path)
     url, key = endpoint(base, key_env)
     rows = []
     for repeat in ("r1", "r2"):
         for token_id, bias in [(token_id, 100) for token_id in db["protocol"]["token_ids"]] + [(32, -100)]:
-            row = chat(url, key, model, [{"role": "user", "content": "x"}], max_tokens=1,
-                       provider=provider,
-                       extra={"temperature": 0, "logit_bias": {str(token_id): bias}})
+            row = gate(chat(url, key, model, [{"role": "user", "content": "x"}], max_tokens=1,
+                            provider=provider, pin=pin,
+                            extra={"temperature": 0, "logit_bias": {str(token_id): bias}}))
             row.update({"repeat": repeat, "token_id": token_id, "bias": bias})
             rows.append(row)
-    return {"result": classify_token_id_rows(rows, db), "observations": rows}
+    unverified = any(not _verified(r) for r in rows)
+    if pin and unverified:
+        return {"result": {"verdict": "ABSTAIN", "reason": "pin_unverified", "namespace": "unknown"},
+                "observations": rows, "pin_peer": pin, "pin_ok": False}
+    return {"result": classify_token_id_rows(rows, db), "observations": rows, "pin_peer": pin,
+            "pin_ok": True if pin and not unverified else None}
 
 
 # ---------------------------------------------------------------- reference DB + classifier
@@ -438,6 +503,7 @@ MIN_FAMILY_GAP = 1.0        # A001: nearest other family must be this much furth
 STRONG_CAPABILITY = 4        # G12: capability evidence this strong counts as two blocks
 BEHAV_MIN_ITEMS = 1          # G18: one disjoint item per block (items need MIN_ITEM_OBS sessions); was 2 until G16
 STACK_FIELDS = {"sys", "asst", "tool_id", "err", "finish", "sysfp", "reasoning_channel"}   # a reference needs all of them
+GPT_TWIN_MODELS = tuple(f"openai/{model}" for model in fp2.GPT_TWIN.split("|"))
 
 
 def lab_of(model_id): return model_id.split("/")[0]
@@ -497,7 +563,8 @@ def build(refs_path, files):
             r["lab"], r["family"] = lab_of(p["model"]), family_of(p["model"])
             r["probes"].append({k: f[k] for k in ("tok", "art_lab", "reason_tok", "stack", "behav")})
             r["provenance"].append({"source": os.path.relpath(fn), "session": p.get("session"),
-                                    "provider": p.get("provider_pin"), "collected_at_unix": p.get("wall")})
+                                    "provider": p.get("provider_pin"), "pin_peer": p.get("pin_peer"),
+                                    "pin_ok": p.get("pin_ok"), "collected_at_unix": p.get("wall")})
     for p in extra:
         if p["model"] in refs: refs[p["model"]].setdefault("behav_extra", []).append(behav_sig(p))
     for (m, s), d in group_samples(samples).items():
@@ -625,24 +692,30 @@ SAMPLE_TASKS = {
 DIST_MARGIN = 0.10    # G17b: calibrated on held-out reference sets only
 
 
-def sample_rows(model, tag, n, base=None, key_env=None, provider=None):
-    """n temperature-1 samples per task, chat path, effort low; per-sample rows (the format build() groups)."""
+def sample_rows(model, tag, n, base=None, key_env=None, provider=None, pin=None):
+    """n temperature-1 samples per task, chat path, effort low; per-sample rows (the format build() groups).
+    Pinned-but-unverified rows keep their text observation but carry attribution_error so the distribution
+    layer can exclude them from identity evidence."""
     url, key = endpoint(base, key_env)
     def one(a):
         task, i = a
-        r = chat(url, key, model, [{"role": "system", "content": SAMPLE_SYSTEM}, {"role": "user", "content": SAMPLE_TASKS[task]}],
-                 max_tokens=400, reasoning={"effort": "low"}, provider=provider, extra={"temperature": 1})
+        r = gate(chat(url, key, model, [{"role": "system", "content": SAMPLE_SYSTEM}, {"role": "user", "content": SAMPLE_TASKS[task]}],
+                      max_tokens=400, reasoning={"effort": "low"}, provider=provider, pin=pin, extra={"temperature": 1}))
         m = (((r.get("json") or {}).get("choices") or [{}])[0].get("message") or {})
-        return {"set": tag, "model": model, "task": task, "rep": i, "status": r.get("status"), "text": m.get("content")}
+        return {"set": tag, "model": model, "task": task, "rep": i, "status": r.get("status"), "text": m.get("content"),
+                "attribution": r.get("attribution"),
+                **({"attribution_error": r["attribution_error"]} if r.get("attribution_error") else {})}
     with cf.ThreadPoolExecutor(6) as ex:
         return list(ex.map(one, [(t, i) for t in SAMPLE_TASKS for i in range(n)]))
 
 
 def group_samples(rows):
-    """per-sample rows {model, set, task, status, text} -> {(model, set): {task: [normalised answers]}}"""
+    """per-sample rows {model, set, task, status, text} -> {(model, set): {task: [normalised answers]}}
+    Quarantined rows (pinned but served by another/absent peer) are kept in the raw rows but must not
+    become distribution evidence."""
     g = collections.defaultdict(lambda: collections.defaultdict(list))
     for r in rows:
-        if r.get("status") == 200 and r.get("text"):
+        if r.get("status") == 200 and r.get("text") and not r.get("attribution_error"):
             g[(r["model"], r["set"])][r["task"]].append(r["text"].strip().lower().strip(".!\"'*` "))
     return {k: dict(v) for k, v in g.items()}
 
@@ -784,7 +857,8 @@ def classify(f, refs, exclude=None, certify=True):
         best = max(ties, key=lead_of); dt1 = model_score(f, cand[best])[1]
     block_lead = lead_of(best)
     # R4 (G8): the lead is counted in independent blocks only (block lead >= 2 implies >= 2 differing fields).
-    model_ok = dt1 <= MAX_MODEL_DISTANCE and block_lead >= MIN_STRUCTURAL_LEAD
+    known_twin = best in GPT_TWIN_MODELS
+    model_ok = not known_twin and dt1 <= MAX_MODEL_DISTANCE and block_lead >= MIN_STRUCTURAL_LEAD
     # G10/G19 certification is a redundant safety check against a single changed evidence item.
     if model_ok and certify:
         model_ok = certify_name(f, cand, best)
@@ -796,19 +870,24 @@ def classify(f, refs, exclude=None, certify=True):
             "score": round(s1, 2), "structural_distance": round(dt1, 2), "margin": round(margin, 2),
             "runner_up": runner[2], "unknown_model": not model_ok,
             "why_model_unknown": None if model_ok else
+                f"known indistinguishable group: {fp2.GPT_TWIN}" if known_twin else
                 f"requires structural_distance<={MAX_MODEL_DISTANCE} "
                 f"and a structural lead >={MIN_STRUCTURAL_LEAD} over the runner-up"}
 
 
 def verify_ref(f, refs, claimed):
-    """CONSISTENT only if the claimed model is the nearest reference and every available layer agrees."""
+    """Compare reference compatibility; classifier abstention is not a contradiction."""
+    if claimed not in refs: return {"claimed": claimed, "verdict": "insufficient_reference"}
     if not valid(f): return {"claimed": claimed, "verdict": "insufficient_data"}
-    r = refs[claimed]; s, dt = model_score(f, r); best = classify(f, refs)
+    r = refs[claimed]; _, dt = model_score(f, r); best = classify(f, refs)
+    named = best["model"] not in ("unknown", "insufficient_data", "insufficient_reference")
     checks = {"tokenizer+stack": dt <= 0.5,
               "artifact": f["art_lab"] is None or f["art_lab"] == r["lab"],
-              "nearest_is_claimed": best["model"] == claimed}
-    return {"claimed": claimed, "verdict": "CONSISTENT" if all(checks.values()) else "MISMATCH",
-            "checks": checks, "nearest": best}
+              "nearest_is_claimed": best["model"] == claimed if named else None}
+    verdict = ("MISMATCH" if any(v is False for v in checks.values()) else
+               "CONSISTENT" if all(checks.values()) else "INDETERMINATE")
+    return {"claimed": claimed, "verdict": verdict, "checks": checks, "nearest": best,
+            "scope": "reference compatibility, not proof of exact model weights or seller intent"}
 
 
 def verify_family(path, claimed):
@@ -817,8 +896,8 @@ def verify_family(path, claimed):
     r = fp2.identify(path, claimed)
     label, twin = r["label"] or "", fp2.GPT_TWIN.split("|")
     group = label.split("|") if label and not label.startswith("MISMATCH") else []
-    if claimed in group or (claimed in twin and label == fp2.GPT_TWIN):
-        verdict = "CONSISTENT" if (len(group) == 1 or label == fp2.GPT_TWIN) else "CONSISTENT_WITH_GROUP"
+    if claimed in group:
+        verdict = "CONSISTENT" if len(group) == 1 else "CONSISTENT_WITH_GROUP"
     else:
         verdict = "MISMATCH" if group else "UNRESOLVED"
     note = ("gpt-6.1-sol and gpt-6-astra are observationally identical (G001-G006); cannot be told apart" if claimed in twin
@@ -1010,27 +1089,28 @@ def _opt(name, default=None):
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     base, kenv, prov = _opt("--base"), _opt("--key-env"), _opt("--provider")
+    pin = _opt("--pin")
     if _opt("--layers"): LAYERS.clear(); LAYERS.update(_opt("--layers").split(","))
     if cmd == "probe":
         out, tag, model = sys.argv[2:5]
-        p = probe(model, base, kenv, prov); p["session"], p["provider_pin"] = tag, prov
+        p = probe(model, base, kenv, prov, pin=pin); p["session"], p["provider_pin"] = tag, prov
         open(out, "a").write(json.dumps(p) + "\n")
         print(tag, model, json.dumps({k: v for k, v in features(p).items() if k != "art"}))
     elif cmd == "build":
         build(sys.argv[2], sys.argv[3:])
     elif cmd == "identify":
-        refs = load_reference_db(sys.argv[2]); f = features(probe(sys.argv[3], base, kenv, prov)); c = classify(f, refs)
+        refs = load_reference_db(sys.argv[2]); f = features(probe(sys.argv[3], base, kenv, prov, pin=pin)); c = classify(f, refs)
         # G17 stage 2: family known, model not, and the family has one-word distribution references -> sample (100 req).
         if c["model"] == "unknown" and any(r.get("dist") and r.get("family") == c["family"] for r in refs.values()):
-            f["dist"] = next(iter(group_samples(sample_rows(sys.argv[3], "id", 10, base, kenv, prov)).values()), None)
+            f["dist"] = next(iter(group_samples(sample_rows(sys.argv[3], "id", 10, base, kenv, prov, pin=pin)).values()), None)
             c = classify(f, refs)
         print(json.dumps({"features": f, "result": c}, indent=1, default=str))
     elif cmd == "token-id":
-        r = identify_token_id_namespace(sys.argv[2], sys.argv[3], base, kenv, prov)
+        r = identify_token_id_namespace(sys.argv[2], sys.argv[3], base, kenv, prov, pin=pin)
         if _opt("--out"): json.dump(r, open(_opt("--out"), "w"), indent=1)
         print(json.dumps(r["result"], indent=1))
     elif cmd == "verify-ref":
-        refs = load_reference_db(sys.argv[2]); f = features(probe(sys.argv[3], base, kenv, prov))
+        refs = load_reference_db(sys.argv[2]); f = features(probe(sys.argv[3], base, kenv, prov, pin=pin))
         print(json.dumps(verify_ref(f, refs, sys.argv[4]), indent=1, default=str))
     elif cmd == "verify":
         print(json.dumps(verify_family(sys.argv[2], sys.argv[3]), indent=1, default=str))
