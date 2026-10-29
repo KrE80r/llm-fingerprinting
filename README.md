@@ -27,6 +27,26 @@ python3 fpx.py --help
 python3 -m unittest test_fpx
 ```
 
+## Assess sellers without overclaiming
+
+For marketplaces, target the seller explicitly with `--pin PEER_ID` on `probe`,
+`identify`, `verify-ref`, or `token-id`. Each response must echo the requested
+`x-antseed-peer-id`; an absent or different echo is not identification evidence.
+
+```bash
+python3 collect_sellers.py --base https://router.example/v1 --out-dir seller-runs/current
+python3 seller_audit.py seller-runs/current/rows.jsonl \
+  --catalog seller-runs/current/catalog.json --refs references.json \
+  --out seller-runs/current/assessment.json --markdown seller-runs/current/assessment.md
+```
+
+This separates **operational readiness** from **exact-model confidence**. Two
+successful tasks do not authenticate a model, a tokenizer match does not prove
+honesty, and a negative baseline-subtracted delta is not a negative raw count.
+Without independent exact-model calibration, identity recommendations stay
+`unknown`. See [evidence requirements and interpretation](docs/SELLER_AUDIT.md).
+Raw runs under `seller-runs/` are not committed; publish code, not seller evidence.
+
 ## Limits (read the report before trusting a result)
 
 - Built for honest, cooperative endpoints. A provider that rewrites replies on purpose can fool it.
