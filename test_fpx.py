@@ -59,6 +59,18 @@ class OpenSetClassificationTest(unittest.TestCase):
         self.assertEqual(result["model"], "unknown")
         self.assertIn(result["candidate_model"], refs)
 
+    def test_estimated_token_counts_are_never_named_even_when_they_match(self):
+        refs = {"anthropic/claude-x": ref("anthropic", "claude")}
+        estimator = fpx.ACCT_LEN // 3   # ~3 chars/token heuristic, as served by stealth/crouton-alpha
+        f = {**features(), "acct_tok": estimator, "accounting": fpx.accounting(estimator)}
+
+        result = fpx.classify(f, refs)
+
+        self.assertEqual(result["accounting"], "impossible")
+        self.assertEqual((result["family"], result["model"]), ("unknown", "unknown"))
+        self.assertNotIn("candidate_model", result)
+        self.assertEqual(fpx.accounting(fpx.ACCT_LEN), "ok")   # one token per random letter is a real tokenizer
+
 
 class LeaveOneLabOutTest(unittest.TestCase):
     def test_counts_correct_unknown_and_wrong_family_names(self):
@@ -185,5 +197,76 @@ class TokenIdNamespaceTest(unittest.TestCase):
 
         self.assertEqual(result["verdict"], "ABSTAIN")
         self.assertEqual(result["reason"], "underdetermined_reference")
+
+
+class OutputBoundaryTest(unittest.TestCase):
+    TEXT = "abcdefghijklmnopqrstuvwxyz" * 4
+    DB = {"texts": [TEXT], "tokenizers": {
+        "evens": {"boundaries": [list(range(2, 104, 2))], "models": ["lab-a/x"]},
+        "fours": {"boundaries": [list(range(4, 104, 4))], "models": ["lab-b/y"]},
+        "triples": {"boundaries": [list(range(3, 104, 3))], "models": ["lab-c/z"]},
+    }}
+
+    def rows(self, cuts, finish="length"):
+        return [{"finish": finish, "text": self.TEXT[:c]} for c in cuts]
+
+    def classify(self, cuts, db=DB):
+        return fpx.classify_cuts([fpx.cut_points(self.rows(cuts), self.TEXT)], db)
+
+    def test_names_the_only_tokenizer_with_every_cut_as_a_boundary(self):
+        result = self.classify(range(2, 60, 2))
+
+        self.assertEqual(result["verdict"], "MATCH")
+        self.assertEqual(result["tokenizer"], "evens")
+        self.assertEqual(result["models"], ["lab-a/x"])
+
+    def test_cuts_shared_by_two_tokenizers_do_not_name_either(self):
+        # every cut is a multiple of 4, so 'evens' and 'fours' both fit
+        result = self.classify(range(4, 100, 4))
+
+        self.assertEqual(result["verdict"], "ABSTAIN")
+        self.assertEqual(result["reason"], "weak_separation")
+        self.assertEqual(set(result["consistent_with"]), {"evens", "fours"})
+
+    def test_two_separating_cuts_are_not_enough(self):
+        result = self.classify(list(range(4, 84, 4)) + [2, 6])   # only two cuts contradict 'fours'
+
+        self.assertEqual(result["verdict"], "ABSTAIN")
+        self.assertEqual(result["consistent_with"], ["evens", "fours"])
+
+    def test_tokenizer_without_reference_on_a_text_is_never_ruled_out_there(self):
+        db = {"texts": [self.TEXT, self.TEXT], "tokenizers": {
+            "evens": {"boundaries": [list(range(2, 104, 2)), list(range(2, 104, 2))], "models": ["lab-a/x"]},
+            "fours": {"boundaries": [list(range(4, 104, 4)), None], "models": ["lab-b/y"]},
+        }}
+        first = fpx.cut_points(self.rows(range(4, 100, 4)), self.TEXT)   # fits both
+        second = fpx.cut_points(self.rows(range(2, 60, 2)), self.TEXT)   # would rule out 'fours', but it has no reference
+
+        result = fpx.classify_cuts([first, second], db)
+
+        self.assertEqual(result["verdict"], "ABSTAIN")
+        self.assertEqual(result["contradictions"]["fours"], 0)
+
+    def test_provider_recutting_by_characters_matches_nothing(self):
+        # a proxy that truncates at ~chars/n instead of model tokens lands between every tokenizer's boundaries
+        result = self.classify(range(5, 104, 5))
+
+        self.assertEqual(result["verdict"], "NOT_ENROLLED")
+
+    def test_only_truncated_exact_prefixes_count_as_cuts(self):
+        rows = (self.rows([10]) + self.rows([12], finish="stop") + [{"finish": "length", "text": "abcX"}]
+                + [{"finish": "length", "text": "  abcd"}, {"finish": "length", "text": "abcdef\ufffd"}])
+
+        self.assertEqual(fpx.cut_points(rows, self.TEXT), {10, 4, 6})
+
+    def test_word_level_release_cannot_contribute_cuts(self):
+        # crouton-alpha's stealth layer released whole words late in a reply: cuts after a space, before punctuation
+        # or between CJK characters must be ignored, mid-word cuts kept
+        text = "Vulpes vulpes, e.g. 我们今天 unbelievably"
+        rows = [{"finish": "length", "text": text[:c]} for c in (7, 13, 14, 20, 21, 30, 32)]
+
+        self.assertEqual(fpx.cut_points(rows, text), {30, 32})
+
+
 if __name__ == "__main__":
     unittest.main()

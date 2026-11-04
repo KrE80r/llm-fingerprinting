@@ -4,6 +4,7 @@ Layers (see docs/PAPER.md):
   L1 artifact forensics   reasoning-artifact format/structure (Fernet tokens, signatures, plain text)
   L2 tokenizer accounting usage.prompt_tokens deltas on 8 probe strings (template overhead cancels)
   L2b token-ID namespace  sparse logit_bias acceptance + forced/forbidden-token controls (optional)
+  L2c output boundaries   where max_tokens cuts an echoed text; survives a provider that invents usage numbers
   L3 serving stack        chat-template Jacobian, tool-call id grammar, raw upstream error, finish reason, fingerprint
   L4 reasoning habit      reasoning tokens spent on a fixed prompt (fp2; decode speed was removed in A003)
   L5 capability gates     per-model API feature gates (Claude, GPT; fp2.py)
@@ -15,17 +16,18 @@ Endpoint styles:
   Anthropic messages, OpenAI responses  verify / cache-oracle
       path: or | resr | as:<peerId> | px:<port> | url:<base-url>  (url: uses $FPX_KEY and native model ids)
 usage:
-  python3 fpx.py identify     <refs.json> <model-id> [--base URL] [--key-env VAR] [--provider NAME]   # unknown/stealth
+  python3 fpx.py identify     <refs.json> <model-id> [--base URL] [--key-env VAR] [--provider NAME] [--cuts boundary-refs.json]   # unknown/stealth
   python3 fpx.py token-id     <token-id-refs.json> <model-id> [--base URL] [--key-env VAR] [--provider NAME]
-  python3 fpx.py verify-ref   <refs.json> <model-id> <claimed-ref> [--base URL] [--key-env VAR]
+  python3 fpx.py cuts         <boundary-refs.json> <model-id> [--base URL] [--key-env VAR] [--provider NAME]   # 140-520 req
+  python3 fpx.py verify-ref   <refs.json> <model-id> <claimed-ref> [--base URL] [--key-env VAR] [--pin PEER]
   python3 fpx.py verify       <path> <claimed>       # Claude/GPT exact model via gates + reasoning habit (7 req)
   python3 fpx.py cache-oracle <path> <claimed> <alt> # substitution check: does label <alt> share <claimed>'s cache?
   python3 fpx.py audit        <path> <claimed> <alt>... [--out f.jsonl]  # STACKED verdict: gates+habit+replay+cache
-  python3 fpx.py probe        <out.jsonl> <tag> <model-id> [...]   # collect reference/held-out probes
+  python3 fpx.py probe        <out.jsonl> <tag> <model-id> [--pin PEER]   # collect reference/held-out probes
   python3 fpx.py build        <refs.json> <probe.jsonl>...         # freeze reference DB
   python3 fpx.py evaluate     <refs.json> <probe.jsonl>... [--layers tok,stack,art]
 """
-import base64, collections, concurrent.futures as cf, itertools, json, math, os, random, re, statistics as st, subprocess, sys, time
+import base64, collections, concurrent.futures as cf, itertools, json, math, os, re, secrets, sys, time, unicodedata
 import fp2
 
 PROBES = {  # tokenizer probes; feature = prompt_tokens(p) - prompt_tokens("ok")
@@ -39,15 +41,28 @@ PROBES = {  # tokenizer probes; feature = prompt_tokens(p) - prompt_tokens("ok")
     "url": "https://example.com/api/v2/items?id=42&sort=desc#section-3",
 }
 REASON_Q = "Is 391 prime? Think it through, then answer yes or no."
+# Accounting check: a fresh random string carrying H bits cannot be tokenized into fewer than H / log2|V| tokens.
+# Letters only, NFKC-stable, so tokenizer normalisation cannot merge two symbols; 2^20 entries exceeds any production vocab.
+ACCT_ALPHABET = [chr(c) for c in range(0x100, 0x800)
+                 if unicodedata.category(chr(c)) in ("Lu", "Ll", "Lo") and unicodedata.normalize("NFKC", chr(c)) == chr(c)]
+ACCT_LEN, MAX_VOCAB_BITS = 800, 20
+ACCT_FLOOR = ACCT_LEN * math.log2(len(ACCT_ALPHABET)) / MAX_VOCAB_BITS
 
+
+def accounting(prompt_tokens):
+    """'impossible' when the reported count is below the information floor: usage is estimated, not counted."""
+    if not prompt_tokens: return None   # 0 = usage not reported (one-off on openai/gpt-6-sol), not an estimate
+    return "impossible" if prompt_tokens < ACCT_FLOOR else "ok"
 
 
 def endpoint(base, key_env):
+    key = os.environ.get(key_env, "") if key_env else ("" if base else fp2._key())
+    if key_env and not key: raise SystemExit(f"--key-env {key_env}: variable is empty or unset")
     if base is None:
-        return "https://openrouter.ai/api/v1/chat/completions", fp2._key()
+        return "https://openrouter.ai/api/v1/chat/completions", key
     base = base.rstrip("/")
     url = base if base.endswith("/chat/completions") else base + "/chat/completions"
-    return url, os.environ.get(key_env or "", "") if key_env else ""
+    return url, key
 
 
 def chat(*a, **kw):
@@ -59,13 +74,14 @@ def chat(*a, **kw):
         time.sleep(wait)
 
 
-def _chat(url, key, model, messages, stream=False, max_tokens=16, reasoning=None, provider=None, timeout=180, extra=None):
+def _chat(url, key, model, messages, stream=False, max_tokens=16, reasoning=None, provider=None, timeout=180, extra=None, pin=None):
     body = {"model": model, "messages": messages, "max_tokens": max_tokens, "stream": stream, **(extra or {})}
     if reasoning: body["reasoning"] = reasoning
     if provider: body["provider"] = {"order": [provider], "allow_fallbacks": False}
     if stream: body["stream_options"] = {"include_usage": True}
     h = {"content-type": "application/json"}
     if key: h["authorization"] = "Bearer " + key
+    if pin: h["x-antseed-pin-peer"] = pin   # reseller audit: bind the request to one seller
     import urllib.request, urllib.error
     rec, chunks, t0 = {"model": model}, [], time.perf_counter_ns()
     try:
@@ -132,12 +148,15 @@ BEHAV = {
 }
 
 
-def probe(model, base=None, key_env=None, provider=None):
+def probe(model, base=None, key_env=None, provider=None, pin=None):
     url, key = endpoint(base, key_env)
-    one = lambda text: chat(url, key, model, [{"role": "user", "content": text}], max_tokens=16, provider=provider)
-    msg = lambda ms, **kw: chat(url, key, model, ms, provider=provider, **kw)
+    one = lambda text: chat(url, key, model, [{"role": "user", "content": text}], max_tokens=16, provider=provider, pin=pin)
+    msg = lambda ms, **kw: chat(url, key, model, ms, provider=provider, pin=pin, **kw)
     with cf.ThreadPoolExecutor(6) as ex:
         tok = dict(zip(["ok", *PROBES], ex.map(one, ["ok", *PROBES.values()])))
+        if all(v.get("status") in (401, 403) for v in tok.values()):
+            raise SystemExit(f"auth failed (HTTP {tok['ok'].get('status')}): {str(tok['ok'].get('error'))[:200]}")
+        acct = ex.submit(one, "".join(secrets.choice(ACCT_ALPHABET) for _ in range(ACCT_LEN)))
         reason = ex.submit(chat, url, key, model, [{"role": "user", "content": REASON_Q}], False, 1500, {"effort": "low"}, provider)
         # A003: no streams. Decode speed tracked host, load and time, not the model, and never changed a decision.
         stack = {  # serving-stack probes (round M2): template Jacobian, tool-call serializer, raw upstream error
@@ -154,7 +173,8 @@ def probe(model, base=None, key_env=None, provider=None):
         behav = {k: v.result() for k, v in behav.items()}
     return {"model": model, "tok": {k: ((v.get("json") or {}).get("usage") or {}).get("prompt_tokens") for k, v in tok.items()},
             "tok_err": {k: v.get("error") for k, v in tok.items() if v.get("status") != 200},
-            "ok_json": tok["ok"].get("json"), "stack": stack, "reason": reason, "behav": behav, "wall": time.time()}
+            "ok_json": tok["ok"].get("json"), "stack": stack, "reason": reason, "behav": behav, "wall": time.time(),
+            "acct_tok": ((acct.result().get("json") or {}).get("usage") or {}).get("prompt_tokens")}
 
 def behav_battery(ex, msg):
     return {k: ex.submit(msg, [{"role": "user", "content": q}], max_tokens=600 if k.startswith(("c_", "h_", "k_")) else 400,
@@ -333,7 +353,8 @@ def features(p):
     tokv = {k: (p["tok"][k] - base) if (p["tok"].get(k) is not None and base is not None) else None for k in PROBES}
     a = artifact(p["reason"])
     return {"tok": tokv, "art": a, "art_lab": lab_from_artifact(a), "stack": stack_sig(p),
-            "reason_tok": a["reasoning_tokens"], "behav": behav_sig(p)}
+            "reason_tok": a["reasoning_tokens"], "behav": behav_sig(p),
+            "acct_tok": p.get("acct_tok"), "accounting": accounting(p.get("acct_tok"))}
 
 
 
@@ -421,6 +442,88 @@ def identify_token_id_namespace(refs_path, model, base=None, key_env=None, provi
             row.update({"repeat": repeat, "token_id": token_id, "bias": bias})
             rows.append(row)
     return {"result": classify_token_id_rows(rows, db), "observations": rows}
+
+
+# ------------------------------------------------------- output-token boundaries
+# A provider can invent usage numbers, but a reply cut by max_tokens still ends where the generating tokenizer put a
+# token boundary. Echoing a fixed text under every budget inside the truncation window samples that boundary set.
+CUT_PROMPT = "Repeat the following text exactly, character for character, nothing else:\n\n"
+CUT_COARSE = [8 << i for i in range(9)]   # 8..2048: hidden reasoning can delay the visible echo by hundreds of tokens
+MAX_DENSE = 400                           # wider windows (unstable reasoning) are sampled at a coarser stride
+MIN_CUTS, MIN_SPLIT = 20, 3               # every other enrolled tokenizer must be contradicted by at least MIN_SPLIT cuts
+BOUNDARY_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "boundary_references.json")
+
+
+def load_boundary_db(path):
+    db = json.load(open(path))
+    if db.get("schema") != "fpx.boundary-reference/v2":
+        raise ValueError(f"{path}: expected fpx.boundary-reference/v2")
+    return db
+
+
+def cut_rows(model, text, base=None, key_env=None, provider=None, pin=None):
+    """Find the budget window where the echo is visible but unfinished, then request every budget inside it."""
+    url, key = endpoint(base, key_env)
+    msgs = [{"role": "user", "content": CUT_PROMPT + text}]
+    for reasoning in ({"effort": "none"}, {"effort": "minimal"}, None):   # least hidden reasoning the endpoint accepts
+        if chat(url, key, model, msgs, max_tokens=8, reasoning=reasoning, provider=provider, pin=pin).get("status") != 400: break
+    def one(n):
+        r = chat(url, key, model, msgs, max_tokens=n, reasoning=reasoning, provider=provider, pin=pin, extra={"temperature": 0})
+        j = r.get("json") or {}; ch = (j.get("choices") or [{}])[0]
+        return {"n": n, "status": r.get("status"), "finish": ch.get("finish_reason"), "text": _choice_text(r),
+                "completion_tokens": (j.get("usage") or {}).get("completion_tokens")}
+    with cf.ThreadPoolExecutor(8) as ex:
+        rows = list(ex.map(one, CUT_COARSE))
+        visible = [r["n"] for r in rows if r["status"] == 200 and r["text"]]
+        if not visible: return rows   # refused, rate-limited, or reasoning outran 2048 tokens
+        lo = max([r["n"] for r in rows if r["status"] == 200 and not r["text"] and r["n"] < min(visible)] + [0])
+        hi = min([r["n"] for r in rows if r["finish"] == "stop" and r["n"] > lo] + [CUT_COARSE[-1]])
+        step = max(1, -(-(hi - lo) // MAX_DENSE))
+        rows += ex.map(one, [n for n in range(lo + 1, hi, step) if n not in CUT_COARSE])
+    return rows
+
+
+_NO_SPACE_SCRIPT = re.compile(r"[\u0e00-\u0e7f\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]")   # Thai, kana, CJK
+
+
+def cut_points(rows, text):
+    """Character offsets where length-truncated replies end, kept only when the reply is an exact prefix of text and
+    the cut falls inside a word. A layer that releases text word by word (stealth/crouton-alpha does for part of a reply)
+    can only cut at spaces, punctuation or between CJK/Thai characters, so cuts there say nothing about the tokenizer.
+    A trailing U+FFFD (a token that ends inside a character) floors to the last whole character."""
+    out = set()
+    for r in rows:
+        t = (r.get("text") or "").lstrip().rstrip("\ufffd"); c = len(t)
+        if (r.get("finish") == "length" and 0 < c < len(text) and text.startswith(t)
+                and text[c - 1].isalnum() and text[c].isalnum() and not _NO_SPACE_SCRIPT.search(text[c - 1:c + 1])):
+            out.add(c)
+    return out
+
+
+def classify_cuts(cuts, db):
+    """cuts: one set per db["texts"] entry. MATCH only when exactly one enrolled tokenizer has every cut as a boundary
+    and every other is contradicted by >= MIN_SPLIT cuts. A tokenizer with no reference on a text (null) cannot be
+    contradicted there, so missing references only make abstention more likely."""
+    contra = {name: sum(len(c - set(b)) for c, b in zip(cuts, t["boundaries"]) if b is not None)
+              for name, t in db["tokenizers"].items()}
+    out = {"cuts": sum(map(len, cuts)), "contradictions": dict(sorted(contra.items(), key=lambda kv: kv[1]))}
+    if out["cuts"] < MIN_CUTS:
+        return {**out, "verdict": "ABSTAIN", "reason": "insufficient_cuts", "tokenizer": "unknown"}
+    ranked = sorted(contra, key=contra.get)
+    if contra[ranked[0]]:
+        return {**out, "verdict": "NOT_ENROLLED", "tokenizer": "unknown",
+                "reason": "every enrolled tokenizer is contradicted; unenrolled tokenizer, or the provider re-cuts replies"}
+    if len(ranked) > 1 and contra[ranked[1]] < MIN_SPLIT:
+        return {**out, "verdict": "ABSTAIN", "reason": "weak_separation", "tokenizer": "unknown",
+                "consistent_with": [n for n in ranked if contra[n] < MIN_SPLIT]}
+    t = db["tokenizers"][ranked[0]]
+    return {**out, "verdict": "MATCH", "tokenizer": ranked[0], "models": t["models"],
+            "scope": "names the tokenizer that generated the reply, not a lab: tokenizers are reused across labs "
+                     "(Nvidia Nemotron-3 ships Mistral's Tekken; Inception Mercury-3 cuts on DeepSeek boundaries)"}
+
+
+def identify_cuts(db, model, base=None, key_env=None, provider=None, pin=None):
+    return classify_cuts([cut_points(cut_rows(model, t, base, key_env, provider, pin), t) for t in db["texts"]], db)
 
 
 # ---------------------------------------------------------------- reference DB + classifier
@@ -625,13 +728,13 @@ SAMPLE_TASKS = {
 DIST_MARGIN = 0.10    # G17b: calibrated on held-out reference sets only
 
 
-def sample_rows(model, tag, n, base=None, key_env=None, provider=None):
+def sample_rows(model, tag, n, base=None, key_env=None, provider=None, pin=None):
     """n temperature-1 samples per task, chat path, effort low; per-sample rows (the format build() groups)."""
     url, key = endpoint(base, key_env)
     def one(a):
         task, i = a
         r = chat(url, key, model, [{"role": "system", "content": SAMPLE_SYSTEM}, {"role": "user", "content": SAMPLE_TASKS[task]}],
-                 max_tokens=400, reasoning={"effort": "low"}, provider=provider, extra={"temperature": 1})
+                 max_tokens=400, reasoning={"effort": "low"}, provider=provider, pin=pin, extra={"temperature": 1})
         m = (((r.get("json") or {}).get("choices") or [{}])[0].get("message") or {})
         return {"set": tag, "model": model, "task": task, "rep": i, "status": r.get("status"), "text": m.get("content")}
     with cf.ThreadPoolExecutor(6) as ex:
@@ -748,6 +851,10 @@ def certify_name(f, cand, best):
 
 def classify(f, refs, exclude=None, certify=True):
     """Open-set classifier: name a family/model only inside frozen acceptance bounds; otherwise abstain."""
+    if f.get("accounting") == "impossible":   # the token-count layers are made up; the bounds were calibrated on real counts
+        return {"lab": "unknown", "family": "unknown", "model": "unknown", "lab_by_artifact": f.get("art_lab"),
+                "accounting": "impossible",
+                "why_unknown": f"prompt_tokens {f.get('acct_tok')} < information floor {ACCT_FLOOR:.0f}: usage is estimated, not counted"}
     if not valid(f):
         return {"lab": "insufficient_data", "family": "insufficient_data", "model": "insufficient_data",
                 "lab_by_artifact": f["art_lab"]}
@@ -1013,24 +1120,29 @@ if __name__ == "__main__":
     if _opt("--layers"): LAYERS.clear(); LAYERS.update(_opt("--layers").split(","))
     if cmd == "probe":
         out, tag, model = sys.argv[2:5]
-        p = probe(model, base, kenv, prov); p["session"], p["provider_pin"] = tag, prov
+        p = probe(model, base, kenv, prov, pin=_opt("--pin"))
+        p["session"], p["provider_pin"] = tag, _opt("--pin") or prov
         open(out, "a").write(json.dumps(p) + "\n")
         print(tag, model, json.dumps({k: v for k, v in features(p).items() if k != "art"}))
     elif cmd == "build":
         build(sys.argv[2], sys.argv[3:])
     elif cmd == "identify":
-        refs = load_reference_db(sys.argv[2]); f = features(probe(sys.argv[3], base, kenv, prov)); c = classify(f, refs)
+        refs = load_reference_db(sys.argv[2]); f = features(probe(sys.argv[3], base, kenv, prov, pin=_opt("--pin"))); c = classify(f, refs)
         # G17 stage 2: family known, model not, and the family has one-word distribution references -> sample (100 req).
         if c["model"] == "unknown" and any(r.get("dist") and r.get("family") == c["family"] for r in refs.values()):
-            f["dist"] = next(iter(group_samples(sample_rows(sys.argv[3], "id", 10, base, kenv, prov)).values()), None)
+            f["dist"] = next(iter(group_samples(sample_rows(sys.argv[3], "id", 10, base, kenv, prov, pin=_opt("--pin"))).values()), None)
             c = classify(f, refs)
+        if c.get("accounting") == "impossible" and os.path.exists(_opt("--cuts", BOUNDARY_DB)):
+            c["output_tokenizer"] = identify_cuts(load_boundary_db(_opt("--cuts", BOUNDARY_DB)), sys.argv[3], base, kenv, prov, _opt("--pin"))
         print(json.dumps({"features": f, "result": c}, indent=1, default=str))
+    elif cmd == "cuts":
+        print(json.dumps(identify_cuts(load_boundary_db(sys.argv[2]), sys.argv[3], base, kenv, prov, _opt("--pin")), indent=1))
     elif cmd == "token-id":
         r = identify_token_id_namespace(sys.argv[2], sys.argv[3], base, kenv, prov)
         if _opt("--out"): json.dump(r, open(_opt("--out"), "w"), indent=1)
         print(json.dumps(r["result"], indent=1))
     elif cmd == "verify-ref":
-        refs = load_reference_db(sys.argv[2]); f = features(probe(sys.argv[3], base, kenv, prov))
+        refs = load_reference_db(sys.argv[2]); f = features(probe(sys.argv[3], base, kenv, prov, pin=_opt("--pin")))
         print(json.dumps(verify_ref(f, refs, sys.argv[4]), indent=1, default=str))
     elif cmd == "verify":
         print(json.dumps(verify_family(sys.argv[2], sys.argv[3]), indent=1, default=str))
